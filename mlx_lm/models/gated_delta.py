@@ -637,6 +637,98 @@ def _unit_tri_inv(m: mx.array) -> mx.array:
     )
 
 
+_TRI_SOLVE_SOURCE = """
+    uint m = thread_position_in_grid.z;      // matrix index
+    uint c = thread_position_in_grid.x;      // right-hand-side column
+    if (c >= N) return;
+
+    const device T* a = A + m * C * C;
+    const device T* b = Bm + m * C * N;
+    device T* x = X + m * C * N;
+
+    if (UPPER) {
+        // A^T is unit upper triangular: back substitution
+        for (int j = C - 1; j >= 0; --j) {
+            float acc = static_cast<float>(b[j * N + c]);
+            for (int i = j + 1; i < C; ++i) {
+                acc -= static_cast<float>(a[i * C + j]) * static_cast<float>(x[i * N + c]);
+            }
+            x[j * N + c] = static_cast<T>(acc);
+        }
+    } else {
+        // A is unit lower triangular: forward substitution
+        for (int j = 0; j < C; ++j) {
+            float acc = static_cast<float>(b[j * N + c]);
+            for (int i = 0; i < j; ++i) {
+                acc -= static_cast<float>(a[j * C + i]) * static_cast<float>(x[i * N + c]);
+            }
+            x[j * N + c] = static_cast<T>(acc);
+        }
+    }
+"""
+
+
+def _make_tri_solve_kernel():
+    if not mx.metal.is_available():
+        return None
+    return mx.fast.metal_kernel(
+        name="unit_tri_solve",
+        input_names=["A", "Bm"],
+        output_names=["X"],
+        source=_TRI_SOLVE_SOURCE,
+    )
+
+
+_tri_solve_kernel = _make_tri_solve_kernel()
+
+
+def _tri_solve_metal(a: mx.array, b: mx.array, upper: bool) -> mx.array:
+    *batch, c_dim, n_dim = b.shape
+    n_mat = 1
+    for d in batch:
+        n_mat *= d
+    threads = min(n_dim, 256)
+    (out,) = _tri_solve_kernel(
+        inputs=[a.reshape(n_mat, c_dim, c_dim), b.reshape(n_mat, c_dim, n_dim)],
+        template=[("T", b.dtype), ("C", c_dim), ("N", n_dim), ("UPPER", upper)],
+        grid=(((n_dim + threads - 1) // threads) * threads, 1, n_mat),
+        threadgroup=(threads, 1, 1),
+        output_shapes=[(n_mat, c_dim, n_dim)],
+        output_dtypes=[b.dtype],
+        init_value=0,
+    )
+    return out.reshape(*batch, c_dim, n_dim)
+
+
+def _use_tri_solve_kernel() -> bool:
+    return _tri_solve_kernel is not None and mx.default_device() == mx.gpu
+
+
+@mx.custom_function
+def _unit_tri_solve(a: mx.array, b: mx.array) -> mx.array:
+    """Solve ``(I + strictly_lower(a)) x = b`` for x.
+
+    Substitution in a single kernel, so the inverse is never materialized. The
+    gradient needs the transposed solve, which autodiff cannot derive through a
+    hand-written kernel, hence the explicit VJP:
+
+        x = A^-1 b  =>  b_bar = A^-T x_bar,  A_bar = tril(-b_bar x^T, -1)
+    """
+    if _use_tri_solve_kernel():
+        return _tri_solve_metal(a, b, upper=False)
+    return _unit_tri_inv(a) @ b
+
+
+@_unit_tri_solve.vjp
+def _unit_tri_solve_vjp(primals, cotangent, output):
+    a, _ = primals
+    if _use_tri_solve_kernel():
+        b_bar = _tri_solve_metal(a, cotangent, upper=True)
+    else:
+        b_bar = mx.swapaxes(_unit_tri_inv(a), -1, -2) @ cotangent
+    return mx.tril(-(b_bar @ mx.swapaxes(output, -1, -2)), -1), b_bar
+
+
 def gated_delta_chunkwise(
     q: mx.array,
     k: mx.array,
@@ -714,8 +806,9 @@ def gated_delta_chunkwise(
         k_t = mx.swapaxes(k_c, -1, -2)
 
         system = eye + mx.where(strict, beta_c[..., :, None] * (k_c @ k_t) * ratio_c, 0.0)
-        u = _unit_tri_inv(system) @ (
-            beta_c[..., None] * (v_c - gamma_c[..., None] * (k_c @ mx.swapaxes(s, -1, -2)))
+        u = _unit_tri_solve(
+            system,
+            beta_c[..., None] * (v_c - gamma_c[..., None] * (k_c @ mx.swapaxes(s, -1, -2))),
         )
 
         attn = mx.where(causal, (q_c @ k_t) * ratio_c, 0.0)

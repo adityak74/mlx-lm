@@ -205,6 +205,31 @@ class TestGatedDeltaChunkwise(unittest.TestCase):
         self.assertLess(_rel_l2(y, y_ref), 1e-5)
         self.assertLess(_rel_l2(s, s_ref), 1e-5)
 
+    def test_fused_solve_matches_matmul_inverse(self):
+        # the kernel and its hand-written VJP against the portable path
+        from mlx_lm.models.gated_delta import _unit_tri_inv, _unit_tri_solve
+
+        mx.random.seed(11)
+        a = mx.eye(64) + mx.tril(mx.random.normal((4, 64, 64)) * 0.1, -1)
+        b = mx.random.normal((4, 64, 32))
+        w = mx.random.normal((4, 64, 32))
+        mx.eval(a, b, w)
+
+        x = _unit_tri_solve(a, b)
+        ref = _unit_tri_inv(a) @ b
+        mx.eval(x, ref)
+        self.assertLess(_rel_l2(x, ref), 1e-5)
+        self.assertLess(_rel_l2(a @ x, b), 1e-5)
+
+        grad_new = mx.grad(lambda a, b: (_unit_tri_solve(a, b) * w).sum(), argnums=(0, 1))
+        grad_ref = mx.grad(lambda a, b: ((_unit_tri_inv(a) @ b) * w).sum(), argnums=(0, 1))
+        ga, gb = grad_new(a, b)
+        ga_ref, gb_ref = grad_ref(a, b)
+        mx.eval(ga, gb, ga_ref, gb_ref)
+        # only the strictly lower triangle of `a` is read
+        self.assertLess(_rel_l2(mx.tril(ga, -1), mx.tril(ga_ref, -1)), 1e-4)
+        self.assertLess(_rel_l2(gb, gb_ref), 1e-4)
+
     def test_gradients_match_ops(self):
         q, k, v, g, beta, state = self._inputs(1, 64, 2, 4, 32, 32, 0.5)
         w = mx.random.normal((1, 64, 4, 32))
